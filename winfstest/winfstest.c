@@ -32,30 +32,70 @@
  */
 
 #include <windows.h>
-#include <winerror.h>
 #include <sddl.h>
 #include <inttypes.h>
 #include <stdio.h>
 
-#if _MSC_VER < 1900
-#define snprintf _snprintf
+/*
+ * The REPARSE_DATA_BUFFER definitions appear to be missing from the user mode headers.
+ */
+#if !defined(SYMLINK_FLAG_RELATIVE)
+#define SYMLINK_FLAG_RELATIVE           1
+typedef struct _REPARSE_DATA_BUFFER
+{
+    ULONG ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    union
+    {
+        struct
+        {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG Flags;
+            WCHAR PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct
+        {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR PathBuffer[1];
+        } MountPointReparseBuffer;
+        struct
+        {
+            UCHAR DataBuffer[1];
+        } GenericReparseBuffer;
+    } DUMMYUNIONNAME;
+} REPARSE_DATA_BUFFER, *PREPARSE_DATA_BUFFER;
 #endif
 
+static int do_SetCurrentDirectory(int argc, wchar_t **argv);
 static int do_CreateFile(int argc, wchar_t **argv);
 static int do_DeleteFile(int argc, wchar_t **argv);
 static int do_CreateDirectory(int argc, wchar_t **argv);
 static int do_RemoveDirectory(int argc, wchar_t **argv);
+static int do_CreateSymbolicLink(int argc, wchar_t **argv);
 static int do_GetFileInformation(int argc, wchar_t **argv);
 static int do_SetFileAttributes(int argc, wchar_t **argv);
 static int do_SetFileTime(int argc, wchar_t **argv);
 static int do_SetEndOfFile(int argc, wchar_t **argv);
+static int do_ReadFile(int argc, wchar_t **argv);
+static int do_WriteFile(int argc, wchar_t **argv);
 static int do_GetFileSecurity(int argc, wchar_t **argv);
 static int do_SetFileSecurity(int argc, wchar_t **argv);
+static int do_GetReparsePoint(int argc, wchar_t **argv);
+static int do_SetReparsePoint(int argc, wchar_t **argv);
+static int do_DeleteReparsePoint(int argc, wchar_t **argv);
 static int do_FindFiles(int argc, wchar_t **argv);
 static int do_FindStreams(int argc, wchar_t **argv);
 static int do_MoveFileEx(int argc, wchar_t **argv);
 static int do_RenameStream(int argc, wchar_t **argv);
 
+static int keep_backup_restore_privileges = 0;
 static int always_print_last_error = 0;
 static int wait_for_input_before_exit = 0;
 
@@ -120,6 +160,20 @@ struct sym symtab[] =
     SYM(FILE_FLAG_OPEN_REPARSE_POINT),
     SYM(FILE_FLAG_OPEN_NO_RECALL),
     SYM(FILE_FLAG_FIRST_PIPE_INSTANCE),
+    SYM(SYMBOLIC_LINK_FLAG_DIRECTORY),
+    SYM(IO_REPARSE_TAG_MOUNT_POINT),
+    SYM(IO_REPARSE_TAG_HSM),
+    SYM(IO_REPARSE_TAG_HSM2),
+    SYM(IO_REPARSE_TAG_SIS),
+    SYM(IO_REPARSE_TAG_WIM),
+    SYM(IO_REPARSE_TAG_CSV),
+    SYM(IO_REPARSE_TAG_DFS),
+    SYM(IO_REPARSE_TAG_SYMLINK),
+    SYM(IO_REPARSE_TAG_DFSR),
+    SYM(IO_REPARSE_TAG_DEDUP),
+    SYM(IO_REPARSE_TAG_NFS),
+    SYM(IO_REPARSE_TAG_FILE_PLACEHOLDER),
+    SYM(IO_REPARSE_TAG_WOF),
     SYM(OWNER_SECURITY_INFORMATION),
     SYM(GROUP_SECURITY_INFORMATION),
     SYM(DACL_SECURITY_INFORMATION),
@@ -171,6 +225,30 @@ static DWORD symval(const wchar_t *name)
     }
     return value;
 }
+static void guidval(const wchar_t *s0, GUID *guid)
+{
+    memset(guid, 0, sizeof *guid);
+    wchar_t *s = (wchar_t *)s0;
+    s += L'{' == *s;
+    guid->Data1 = wcstoul(s, &s, 16);
+    s += L'-' == *s;
+    guid->Data2 = wcstoul(s, &s, 16);
+    s += L'-' == *s;
+    guid->Data3 = wcstoul(s, &s, 16);
+    s += L'-' == *s;
+    uint32_t Data40 = wcstoul(s, &s, 16);
+    guid->Data4[0] = (Data40 & 0xff00) >> 8;
+    guid->Data4[1] = (Data40 & 0x00ff);
+    s += L'-' == *s;
+    uint64_t Data42 = wcstoull(s, &s, 16);
+    guid->Data4[2] = (Data42 & 0xff0000000000) >> 40;
+    guid->Data4[3] = (Data42 & 0x00ff00000000) >> 32;
+    guid->Data4[4] = (Data42 & 0x0000ff000000) >> 24;
+    guid->Data4[5] = (Data42 & 0x000000ff0000) >> 16;
+    guid->Data4[6] = (Data42 & 0x00000000ff00) >> 8;
+    guid->Data4[7] = (Data42 & 0x0000000000ff);
+    //s += L'}' == *s;
+}
 
 #define API(n)                          { L#n, do_##n }
 struct api
@@ -180,16 +258,23 @@ struct api
 };
 struct api apitab[] =
 {
+    API(SetCurrentDirectory),
     API(CreateFile),
     API(DeleteFile),
     API(CreateDirectory),
     API(RemoveDirectory),
+    API(CreateSymbolicLink),
     API(GetFileInformation),
     API(SetFileAttributes),
     API(SetFileTime),
     API(SetEndOfFile),
+    API(ReadFile),
+    API(WriteFile),
     API(GetFileSecurity),
     API(SetFileSecurity),
+    API(GetReparsePoint),
+    API(SetReparsePoint),
+    API(DeleteReparsePoint),
     API(FindFiles),
     API(FindStreams),
     API(MoveFileEx),
@@ -253,6 +338,35 @@ static void errprint(int success)
         printf("%S\n", errstr(GetLastError()));
 }
 
+static void disable_backup_restore_privileges(void)
+{
+    union
+    {
+        TOKEN_PRIVILEGES P;
+        UINT8 B[sizeof(TOKEN_PRIVILEGES) + sizeof(LUID_AND_ATTRIBUTES)];
+    } Privileges;
+    HANDLE Token;
+    Privileges.P.PrivilegeCount = 2;
+    Privileges.P.Privileges[0].Attributes = 0;
+    Privileges.P.Privileges[1].Attributes = 0;
+    if (!LookupPrivilegeValueW(0, L"" SE_BACKUP_NAME, &Privileges.P.Privileges[0].Luid) ||
+        !LookupPrivilegeValueW(0, L"" SE_RESTORE_NAME, &Privileges.P.Privileges[1].Luid))
+        fail("cannot lookup backup/restore privileges");
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &Token))
+        fail("cannot open process token");
+    if (!AdjustTokenPrivileges(Token, FALSE, &Privileges.P, 0, 0, 0))
+        fail("cannot disable backup/restore privileges");
+    CloseHandle(Token);
+}
+
+static int do_SetCurrentDirectory(int argc, wchar_t **argv)
+{
+    if (argc != 2)
+        fail("usage: SetCurrentDirectory PathName");
+    BOOL r = SetCurrentDirectoryW(argv[1]);
+    errprint(r);
+    return 0;
+}
 static int do_CreateFile(int argc, wchar_t **argv)
 {
     if (argc != 8)
@@ -305,6 +419,14 @@ static int do_RemoveDirectory(int argc, wchar_t **argv)
     if (argc != 2)
         fail("usage: RemoveDirectory PathName");
     BOOL r = RemoveDirectoryW(argv[1]);
+    errprint(r);
+    return 0;
+}
+static int do_CreateSymbolicLink(int argc, wchar_t **argv)
+{
+    if (argc != 4)
+        fail("usage: CreateSymbolicLink SymlinkFileName TargetFileName Flags");
+    BOOL r = CreateSymbolicLinkW(argv[1], argv[2], symval(argv[3]));
     errprint(r);
     return 0;
 }
@@ -428,6 +550,69 @@ static int do_SetEndOfFile(int argc, wchar_t **argv)
     }
     return 0;
 }
+static int do_ReadFile(int argc, wchar_t **argv)
+{
+    if (argc != 4)
+        fail("usage: ReadFile FileName Offset Length");
+    HANDLE h = CreateFileW(argv[1],
+        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, 0);
+    if (INVALID_HANDLE_VALUE == h)
+        errprint(0);
+    else
+    {
+        UINT8 Buffer[256];
+        DWORD Bytes = symval(argv[3]);
+        OVERLAPPED Overlapped = { 0 };
+        Overlapped.Offset = symval(argv[2]);
+        BOOL r = ReadFile(h, Buffer, Bytes, &Bytes, &Overlapped);
+        if (r)
+        {
+            errprint(1);
+            printf("Length=%lu Data=\"", Bytes);
+            char space[2] = { 0, 0 };
+            for (DWORD i = 0; Bytes > i; i++)
+            {
+                printf("%s%02X", space, Buffer[i]);
+                space[0] = ' ';
+            }
+            printf("\"\n");
+        }
+        else
+            errprint(0);
+        CloseHandle(h);
+    }
+    return 0;
+}
+static int do_WriteFile(int argc, wchar_t **argv)
+{
+    if (argc < 4 || argc > 3 + 256)
+        fail("usage: WriteFile FileName Offset Byte ...");
+    HANDLE h = CreateFileW(argv[1],
+        GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, 0);
+    if (INVALID_HANDLE_VALUE == h)
+        errprint(0);
+    else
+    {
+        UINT8 Buffer[256];
+        DWORD Bytes = symval(argv[3]);
+        OVERLAPPED Overlapped = { 0 };
+        for (DWORD i = 0; Bytes > i && argc > 4+i; i++)
+            Buffer[i] = wcstoul(argv[4 + i], 0, 16);
+        Overlapped.Offset = symval(argv[2]);
+        BOOL r = WriteFile(h, Buffer, Bytes, &Bytes, &Overlapped);
+        if (r)
+        {
+            errprint(1);
+            printf("Length=%lu\n", Bytes);
+        }
+        else
+            errprint(0);
+        CloseHandle(h);
+    }
+    return 0;
+}
 static int do_GetFileSecurity(int argc, wchar_t **argv)
 {
     if (argc != 3)
@@ -480,6 +665,152 @@ static int do_SetFileSecurity(int argc, wchar_t **argv)
     BOOL r = SetFileSecurityW(argv[1], SecurityInformation, SecurityDescriptor);
     errprint(r);
     LocalFree(SecurityDescriptor);
+    return 0;
+}
+static int do_GetReparsePoint(int argc, wchar_t **argv)
+{
+    if (argc != 2)
+        fail("usage: GetReparsePoint FileName");
+    HANDLE h = CreateFileW(argv[1],
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, 0);
+    if (INVALID_HANDLE_VALUE == h)
+        errprint(0);
+    else
+    {
+        union
+        {
+            REPARSE_DATA_BUFFER D;
+            REPARSE_GUID_DATA_BUFFER G;
+            UINT8 B[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+        } ReparseDataBuf;
+        DWORD Bytes;
+        BOOL r = DeviceIoControl(h, FSCTL_GET_REPARSE_POINT,
+            0, 0,
+            &ReparseDataBuf, sizeof ReparseDataBuf,
+            &Bytes, 0);
+        if (r)
+        {
+            errprint(1);
+            if (IO_REPARSE_TAG_MOUNT_POINT == ReparseDataBuf.D.ReparseTag)
+            {
+                printf("ReparseTag=IO_REPARSE_TAG_MOUNT_POINT "
+                    "SubstituteName=\"%.*S\" PrintName=\"%.*S\""
+                    "\n",
+                    (int)(ReparseDataBuf.D.MountPointReparseBuffer.SubstituteNameLength / sizeof(WCHAR)),
+                    ReparseDataBuf.D.MountPointReparseBuffer.PathBuffer +
+                        ReparseDataBuf.D.MountPointReparseBuffer.SubstituteNameOffset / sizeof(WCHAR),
+                    (int)(ReparseDataBuf.D.MountPointReparseBuffer.PrintNameLength / sizeof(WCHAR)),
+                    ReparseDataBuf.D.MountPointReparseBuffer.PathBuffer +
+                        ReparseDataBuf.D.MountPointReparseBuffer.PrintNameOffset / sizeof(WCHAR));
+            }
+            else if (IO_REPARSE_TAG_SYMLINK == ReparseDataBuf.D.ReparseTag)
+            {
+                printf("ReparseTag=IO_REPARSE_TAG_SYMLINK "
+                    "SubstituteName=\"%.*S\" PrintName=\"%.*S\" Flags=%u"
+                    "\n",
+                    (int)(ReparseDataBuf.D.SymbolicLinkReparseBuffer.SubstituteNameLength / sizeof(WCHAR)),
+                    ReparseDataBuf.D.SymbolicLinkReparseBuffer.PathBuffer +
+                        ReparseDataBuf.D.SymbolicLinkReparseBuffer.SubstituteNameOffset / sizeof(WCHAR),
+                    (int)(ReparseDataBuf.D.SymbolicLinkReparseBuffer.PrintNameLength / sizeof(WCHAR)),
+                    ReparseDataBuf.D.SymbolicLinkReparseBuffer.PathBuffer +
+                        ReparseDataBuf.D.SymbolicLinkReparseBuffer.PrintNameOffset / sizeof(WCHAR),
+                    ReparseDataBuf.D.SymbolicLinkReparseBuffer.Flags);
+            }
+            else if (IsReparseTagMicrosoft(ReparseDataBuf.D.ReparseTag))
+            {
+                printf("ReparseTag=%#" PRIx32 " ReparseDataLength=%hu"
+                    "\n",
+                    ReparseDataBuf.D.ReparseTag, ReparseDataBuf.D.ReparseDataLength);
+            }
+            else
+            {
+#define Guid ReparseDataBuf.G.ReparseGuid
+                printf("ReparseTag=%#" PRIx32 " ReparseDataLength=%hu "
+                    "ReparseGuid={%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} "
+                    "ReparseData=\"",
+                    ReparseDataBuf.G.ReparseTag, ReparseDataBuf.G.ReparseDataLength,
+                    Guid.Data1, Guid.Data2, Guid.Data3,
+                    Guid.Data4[0], Guid.Data4[1], Guid.Data4[2], Guid.Data4[3],
+                    Guid.Data4[4], Guid.Data4[5], Guid.Data4[6], Guid.Data4[7]);
+                char space[2] = { 0, 0 };
+                for (USHORT i = 0; ReparseDataBuf.G.ReparseDataLength > i; i++)
+                {
+                    printf("%s%02X", space, ReparseDataBuf.G.GenericReparseBuffer.DataBuffer[i]);
+                    space[0] = ' ';
+                }
+                printf("\"\n");
+#undef Guid
+            }
+        }
+        else
+            errprint(0);
+        CloseHandle(h);
+    }
+    return 0;
+}
+static int do_SetReparsePoint(int argc, wchar_t **argv)
+{
+    if (argc < 5 || argc > 4 + 256)
+        fail("usage: SetReparsePoint FileName ReparseTag GUID Byte ...");
+    HANDLE h = CreateFileW(argv[1],
+        FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, 0);
+    if (INVALID_HANDLE_VALUE == h)
+        errprint(0);
+    else
+    {
+        union
+        {
+            REPARSE_DATA_BUFFER D;
+            REPARSE_GUID_DATA_BUFFER G;
+            UINT8 B[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+        } ReparseDataBuf;
+        DWORD Bytes;
+        ReparseDataBuf.G.ReparseTag = symval(argv[2]);
+        ReparseDataBuf.G.ReparseDataLength = argc - 4;
+        ReparseDataBuf.G.Reserved = 0;
+        guidval(argv[3], &ReparseDataBuf.G.ReparseGuid);
+        for (USHORT i = 0; ReparseDataBuf.G.ReparseDataLength > i; i++)
+            ReparseDataBuf.G.GenericReparseBuffer.DataBuffer[i] = wcstoul(argv[4 + i], 0, 16);
+        BOOL r = DeviceIoControl(h, FSCTL_SET_REPARSE_POINT,
+            &ReparseDataBuf, REPARSE_GUID_DATA_BUFFER_HEADER_SIZE + ReparseDataBuf.G.ReparseDataLength,
+            0, 0,
+            &Bytes, 0);
+        errprint(r);
+        CloseHandle(h);
+    }
+    return 0;
+}
+static int do_DeleteReparsePoint(int argc, wchar_t **argv)
+{
+    if (argc != 4)
+        fail("usage: DeleteReparsePoint FileName ReparseTag GUID");
+    HANDLE h = CreateFileW(argv[1],
+        FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, 0);
+    if (INVALID_HANDLE_VALUE == h)
+        errprint(0);
+    else
+    {
+        union
+        {
+            REPARSE_DATA_BUFFER D;
+            REPARSE_GUID_DATA_BUFFER G;
+            UINT8 B[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+        } ReparseDataBuf;
+        DWORD Bytes;
+        ReparseDataBuf.G.ReparseTag = symval(argv[2]);
+        ReparseDataBuf.G.ReparseDataLength = 0;
+        ReparseDataBuf.G.Reserved = 0;
+        guidval(argv[3], &ReparseDataBuf.G.ReparseGuid);
+        BOOL r = DeviceIoControl(h, FSCTL_DELETE_REPARSE_POINT,
+            &ReparseDataBuf, REPARSE_GUID_DATA_BUFFER_HEADER_SIZE,
+            0, 0,
+            &Bytes, 0);
+        errprint(r);
+        CloseHandle(h);
+    }
     return 0;
 }
 static int do_FindFiles(int argc, wchar_t **argv)
@@ -555,7 +886,7 @@ static int do_RenameStream(int argc, wchar_t **argv)
     if (argc != 4 || ':' != argv[2][0])
         fail("usage: RenameStream FileName:ExistingStreamName :NewStreamName ReplaceIfExists");
     fail("not implemented!");
-
+#if 0
     HANDLE h = CreateFileW(argv[1],
         DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -585,12 +916,12 @@ static int do_RenameStream(int argc, wchar_t **argv)
         errprint(r);
         CloseHandle(h);
     }
-
+#endif
     return 0;
 }
 static void usage()
 {
-    fprintf(stderr, "usage: winfstest [-w][-e] ApiName args...\n");
+    fprintf(stderr, "usage: winfstest [-P][-w][-e] ApiName args...\n");
     for (size_t i = 0; sizeof apitab / sizeof apitab[0] > i; i++)
         fprintf(stderr, "    %S\n", apitab[i].name);
     exit(1);
@@ -603,6 +934,13 @@ int wmain(int argc, wchar_t **argv)
     argc--; argv++;
     if (argc < 1)
         usage();
+    if (0 == wcscmp(L"-P", argv[0]))
+    {
+        keep_backup_restore_privileges = 1;
+        argc--; argv++;
+        if (argc < 1)
+            usage();
+    }
     if (0 == wcscmp(L"-w", argv[0]))
     {
         wait_for_input_before_exit = 1;
@@ -620,6 +958,8 @@ int wmain(int argc, wchar_t **argv)
     struct api *api = apiget(argv[0]);
     if (0 == api)
         fail("cannot find API %S", argv[0]);
+    if (!keep_backup_restore_privileges)
+        disable_backup_restore_privileges();
     int ec = api->fn(argc, argv);
     fclose(stdout);
     if (wait_for_input_before_exit)

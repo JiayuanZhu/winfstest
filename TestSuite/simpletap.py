@@ -91,16 +91,18 @@ if "__main__" == __name__:
         okstr = "\x1B[32mok\x1B[0m" if colors else "ok"
         kostr = "\x1B[31mnot ok\x1B[0m" if colors else "not ok"
         totals = [0, 0]
-        testenv_tmppath = ""
-        if len(sys.argv)>2:
-            testenv_tmppath = sys.argv[2]
-        for arg in [sys.argv[1]]:
+        argv = sys.argv[1:]
+        if argv and "--run" == argv[0]:
+            argv = [os.path.join(os.path.dirname(sys.argv[0]), "t", arg) for arg in argv[1:]]
+            if not argv:
+                argv = [os.path.join(os.path.dirname(sys.argv[0]), "t")]
+        for arg in argv:
             for dirpath, dirnames, filenames in walktree(arg):
                 for filename in filenames:
                     if filename.endswith(".t"):
                         filename = os.path.join(dirpath, filename)
                         writehead(filename)
-                        out = subprocess.check_output([sys.executable, filename, testenv_tmppath],
+                        out = subprocess.check_output([sys.executable, filename],
                             stderr=subprocess.STDOUT, universal_newlines=True)
                         for i in parse(out.splitlines()):
                             if "RR" == i[0]:
@@ -138,6 +140,7 @@ if "__main__" == __name__:
             if totals[1]:
                 write("%s%s %s/%s" % (" - " if totals[0] else "", kostr, totals[1], totals[0] + totals[1]))
             writenl("")
+        sys.exit(1 if totals[1] else 0)
 
     try:
         main()
