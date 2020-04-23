@@ -62,7 +62,7 @@ def parse(iter):
     if pl is None:
         yield ("RR", "?", ok, ko)
     else:
-        yield ("RR", set(xrange(pl[0], pl[1])) - ok - ko, ok, ko)
+        yield ("RR", set(range(pl[0], pl[1])) - ok - ko, ok, ko)
 
 if "__main__" == __name__:
     import os, subprocess, sys
@@ -144,8 +144,8 @@ if "__main__" == __name__:
 
     try:
         main()
-    except subprocess.CalledProcessError, ex:
-        print >>sys.stderr
-        print >>sys.stderr, ex
-        print >>sys.stderr, ex.output
+    except subprocess.CalledProcessError as ex:
+        print(sys.stderr)
+        print(sys.stderr, ex)
+        print(sys.stderr, ex.output)
         sys.exit(ex.returncode)
